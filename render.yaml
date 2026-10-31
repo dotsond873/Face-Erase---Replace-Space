@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: face-erase-replace
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: MONGO_URL
+        sync: false
+      - key: DB_NAME
+        value: face_erase
