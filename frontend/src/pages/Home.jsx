@@ -12,7 +12,9 @@ import {
   Loader2,
 } from "lucide-react";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+const BACKEND_URL = (process.env.REACT_APP_BACKEND_URL || "").replace(/\/$/, "");
+const sessionId = localStorage.getItem("face-erase-session") || crypto.randomUUID();
+localStorage.setItem("face-erase-session", sessionId);
 const API = `${BACKEND_URL}/api`;
 
 const LOADING_PHRASES = [
@@ -43,7 +45,14 @@ function Dropzone({ label, hint, value, onChange, testid }) {
 
   const handleFile = async (file) => {
     if (!file) return;
-    if (!file.type.startsWith("image/")) return;
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+      window.alert("Choose a JPEG, PNG, or WebP photo.");
+      return;
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      window.alert("Each photo must be under 10 MB.");
+      return;
+    }
     const dataUrl = await fileToBase64(file);
     onChange(dataUrl);
   };
@@ -92,7 +101,7 @@ function Dropzone({ label, hint, value, onChange, testid }) {
         <input
           ref={inputRef}
           type="file"
-          accept="image/*"
+          accept="image/jpeg,image/png,image/webp"
           className="hidden"
           onChange={(e) => handleFile(e.target.files?.[0])}
           data-testid={`${testid}-input`}
@@ -104,9 +113,9 @@ function Dropzone({ label, hint, value, onChange, testid }) {
 
 export default function Home() {
   const [img1, setImg1] = useState(null); // base photo (your photo)
-  const [img2, setImg2] = useState(null); // celebrity photo
+  const [img2, setImg2] = useState(null); // replacement photo
   const [prompt, setPrompt] = useState(
-    "Replace the woman in the first photo with the woman from the second photo (Jennifer Aniston). Keep the man, the motorcycles, the road and everyone else exactly the same. Make it photorealistic, same lighting and grain as the original."
+    "Replace the selected person in the first photo with the person from the second photo. Preserve the background and everyone else, matching the original lighting and perspective."
   );
   const [loading, setLoading] = useState(false);
   const [loadingPhrase, setLoadingPhrase] = useState(LOADING_PHRASES[0]);
@@ -116,7 +125,7 @@ export default function Home() {
 
   const loadCreations = async () => {
     try {
-      const res = await axios.get(`${API}/creations`);
+      const res = await axios.get(`${API}/creations?session_id=${sessionId}`);
       setCreations(res.data || []);
     } catch (e) {
       // ignore
@@ -156,6 +165,7 @@ export default function Home() {
           image1_base64: img1,
           image2_base64: img2,
           prompt,
+          session_id: sessionId,
         },
         { timeout: 180000 }
       );
@@ -179,9 +189,9 @@ export default function Home() {
 
   const onDelete = async (id) => {
     try {
-      await axios.delete(`${API}/creations/${id}`);
+      await axios.delete(`${API}/creations/${id}?session_id=${sessionId}`);
       loadCreations();
-    } catch (e) {}
+    } catch (e) { setError("Could not remove that photo. Please try again."); }
   };
 
   return (
@@ -191,12 +201,12 @@ export default function Home() {
         <div className="flex items-center gap-2">
           <Sparkles size={18} className="gold" />
           <span className="font-display text-2xl tracking-tight">
-            Mise·en·Scène
+            Face Erase & Replace
           </span>
         </div>
         <div className="hidden md:flex items-center gap-3 text-white/60 text-sm">
           <span className="chip">
-            <Wand2 size={12} /> Gemini Nano Banana
+            <Wand2 size={12} /> Photo editing studio
           </span>
         </div>
       </header>
@@ -248,8 +258,8 @@ export default function Home() {
 
             <div className="md:col-span-5">
               <Dropzone
-                label="Photo Two · The Guest"
-                hint="Celebrity"
+                label="Photo Two · The Replacement"
+                hint="Replacement photo"
                 value={img2}
                 onChange={setImg2}
                 testid="celebrity-photo-upload"
@@ -270,6 +280,7 @@ export default function Home() {
                 onChange={(e) => setPrompt(e.target.value)}
                 rows={4}
                 className="input-dark"
+                maxLength={4000}
                 placeholder="Describe the scene you want…"
                 data-testid="scene-prompt-input"
               />
@@ -307,7 +318,7 @@ export default function Home() {
                 )}
               </button>
               <p className="text-xs text-white/40 text-center">
-                One image, one moment. Takes ~20 seconds.
+                One image, one moment. Editing may take a few minutes.
               </p>
             </div>
           </div>
@@ -404,7 +415,7 @@ export default function Home() {
                     alt={c.prompt}
                     className="w-full object-cover transition-transform duration-500 group-hover:scale-105"
                   />
-                  <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/0 to-black/0 opacity-0 group-hover:opacity-100 transition-opacity flex items-end p-3 gap-2">
+                  <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/0 to-black/0 opacity-100 transition-opacity flex items-end p-3 gap-2">
                     <button
                       onClick={() =>
                         onDownload(c.result_image_base64, c.mime_type, i)
@@ -434,7 +445,7 @@ export default function Home() {
 
       <footer className="relative z-10 px-6 md:px-12 py-8 text-center text-white/30 text-xs uppercase tracking-[0.3em]">
         <span className="inline-flex items-center gap-2">
-          <ImageIcon size={12} /> Made with Mise·en·Scène
+          <ImageIcon size={12} /> Made with Face Erase & Replace
         </span>
       </footer>
     </div>

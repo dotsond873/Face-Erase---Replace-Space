@@ -11,7 +11,11 @@ from typing import List, Optional
 import uuid
 from datetime import datetime, timezone
 
-from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
+import httpx
+import binascii
+import io
+from PIL import Image, UnidentifiedImageError
+from fastapi.staticfiles import StaticFiles
 
 
 ROOT_DIR = Path(__file__).parent
@@ -31,9 +35,10 @@ api_router = APIRouter(prefix="/api")
 
 # ===== Models =====
 class GenerateRequest(BaseModel):
-    image1_base64: str  # base64 only (no data: prefix)
-    image2_base64: str
-    prompt: str
+    image1_base64: str = Field(max_length=14000000)
+    image2_base64: str = Field(max_length=14000000)
+    prompt: str = Field(min_length=1, max_length=4000)
+    session_id: str = Field(pattern=r"^[A-Za-z0-9_-]{16,100}$")
 
 
 class Creation(BaseModel):
@@ -69,46 +74,52 @@ async def root():
 
 @api_router.post("/generate-photo", response_model=CreationSummary)
 async def generate_photo(payload: GenerateRequest):
-    api_key = os.environ.get("EMERGENT_LLM_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        raise HTTPException(status_code=500, detail="EMERGENT_LLM_KEY not configured")
-
-    img1 = _strip_data_url(payload.image1_base64)
-    img2 = _strip_data_url(payload.image2_base64)
+        raise HTTPException(status_code=503, detail="Set GEMINI_API_KEY on the server to enable photo editing.")
     prompt = payload.prompt.strip()
     if not prompt:
-        raise HTTPException(status_code=400, detail="Prompt is required")
-
-    session_id = str(uuid.uuid4())
-    chat = LlmChat(
-        api_key=api_key,
-        session_id=session_id,
-        system_message="You are an expert photo editor that creates photorealistic composite images.",
-    )
-    chat.with_model("gemini", "gemini-3.1-flash-image-preview").with_params(
-        modalities=["image", "text"]
-    )
-
-    msg = UserMessage(
-        text=prompt,
-        file_contents=[ImageContent(img1), ImageContent(img2)],
-    )
-
+        raise HTTPException(status_code=400, detail="Describe the photo edit you want.")
+    parts = [{"text": prompt}]
+    for value in (payload.image1_base64, payload.image2_base64):
+        try:
+            raw = base64.b64decode(_strip_data_url(value), validate=True)
+            if len(raw) > 10 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="Each photo must be under 10 MB.")
+            with Image.open(io.BytesIO(raw)) as photo:
+                if photo.width * photo.height > 25000000:
+                    raise HTTPException(status_code=413, detail="Use a photo under 25 megapixels.")
+                mime = Image.MIME.get(photo.format)
+                photo.verify()
+            if mime not in {"image/png", "image/jpeg", "image/webp"}:
+                raise ValueError("Unsupported image")
+        except (ValueError, binascii.Error, UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+            raise HTTPException(status_code=400, detail="Upload a valid JPEG, PNG, or WebP photo.") from exc
+        parts.append({"inlineData": {"mimeType": mime, "data": base64.b64encode(raw).decode()}})
+    model = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
     try:
-        text, images = await chat.send_message_multimodal_response(msg)
-    except Exception as e:
-        logger.exception("Image generation failed")
-        raise HTTPException(status_code=502, detail=f"Image generation failed: {str(e)}")
-
-    if not images:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Model did not return an image. Response: {text[:200] if text else ''}",
-        )
-
-    first = images[0]
-    result_b64 = first.get("data", "")
-    mime_type = first.get("mime_type", "image/png")
+        async with httpx.AsyncClient(timeout=150) as http:
+            response = await http.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                headers={"x-goog-api-key": api_key},
+                json={"contents": [{"parts": parts}], "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}},
+            )
+        if response.status_code != 200:
+            logger.warning("Image provider returned status %s", response.status_code)
+            detail = "Image service quota reached. Check your Gemini quota and billing." if response.status_code == 429 else "Image service could not complete the edit. Check the server API key and model."
+            raise HTTPException(status_code=502, detail=detail)
+        result = response.json()
+        output = next((part["inlineData"] for candidate in result.get("candidates", [])
+                       for part in candidate.get("content", {}).get("parts", [])
+                       if part.get("inlineData", {}).get("mimeType", "").startswith("image/")), None)
+        if not output or not output.get("data"):
+            raise HTTPException(status_code=422, detail="The image service returned no edited photo. Try different photos or revise the instructions.")
+        result_b64 = output["data"]
+        mime_type = output["mimeType"]
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail="Photo editing timed out. Please try again.") from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="The image service is unavailable. Please try again.") from exc
 
     creation = Creation(
         prompt=prompt,
@@ -116,6 +127,7 @@ async def generate_photo(payload: GenerateRequest):
         mime_type=mime_type,
     )
     doc = creation.model_dump()
+    doc["session_id"] = payload.session_id
     doc["created_at"] = doc["created_at"].isoformat()
     await db.creations.insert_one(doc)
 
@@ -123,8 +135,8 @@ async def generate_photo(payload: GenerateRequest):
 
 
 @api_router.get("/creations", response_model=List[CreationSummary])
-async def list_creations():
-    docs = await db.creations.find({}, {"_id": 0}).sort("created_at", -1).to_list(100)
+async def list_creations(session_id: str):
+    docs = await db.creations.find({"session_id": session_id}, {"_id": 0}).sort("created_at", -1).to_list(100)
     out: List[CreationSummary] = []
     for d in docs:
         if isinstance(d.get("created_at"), str):
@@ -134,8 +146,8 @@ async def list_creations():
 
 
 @api_router.delete("/creations/{creation_id}")
-async def delete_creation(creation_id: str):
-    res = await db.creations.delete_one({"id": creation_id})
+async def delete_creation(creation_id: str, session_id: str):
+    res = await db.creations.delete_one({"id": creation_id, "session_id": session_id})
     return {"deleted": res.deleted_count}
 
 
@@ -144,7 +156,7 @@ app.include_router(api_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
+    allow_credentials=False,
     allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
     allow_methods=["*"],
     allow_headers=["*"],
@@ -161,3 +173,12 @@ logger = logging.getLogger(__name__)
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
+
+
+@app.get("/health")
+async def health():
+    return {"status": "online", "image_provider_ready": bool(os.environ.get("GEMINI_API_KEY"))}
+
+frontend_build = ROOT_DIR.parent / "frontend" / "build"
+if frontend_build.is_dir():
+    app.mount("/", StaticFiles(directory=frontend_build, html=True), name="frontend")
